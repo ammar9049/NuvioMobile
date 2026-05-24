@@ -38,5 +38,12 @@ jobs:
         run: |
           echo "sdk.dir=$ANDROID_HOME" > local.properties
 
-      - name: Compile Android Kotlin (fullDebug)
-        run: ./gradlew :composeApp:compileFullDebugKotlinAndroid --no-daemon --stacktrace
+      - name: Build APK (fullDebug)
+        run: ./gradlew :composeApp:assembleFullDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuvio-full-debug
+          path: composeApp/build/outputs/apk/full/debug/*.apk
+          retention-days: 7
