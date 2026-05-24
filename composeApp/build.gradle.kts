@@ -252,23 +252,14 @@ kotlin {
             implementation(libs.androidx.core.splashscreen)
             implementation(libs.androidx.work.runtime)
             implementation(libs.coil.gif)
-            implementation("androidx.recyclerview:recyclerview:1.4.0")
             implementation("com.squareup.okhttp3:okhttp:4.12.0")
-            implementation("com.google.code.gson:gson:2.11.0")
-            implementation("io.github.peerless2012:ass-media:0.4.0-beta01")
             implementation(libs.ktor.client.android)
-            implementation(libs.androidx.media3.exoplayer.hls)
-            implementation(libs.androidx.media3.exoplayer.dash)
-            implementation(libs.androidx.media3.exoplayer.smoothstreaming)
-            implementation(libs.androidx.media3.exoplayer.rtsp)
-            implementation(libs.androidx.media3.datasource)
-            implementation(libs.androidx.media3.datasource.okhttp)
-            implementation(libs.androidx.media3.decoder)
-            implementation(libs.androidx.media3.session)
+            // media3-common + media3-datasource retained for YoutubeChunkedDataSourceFactory
             implementation(libs.androidx.media3.common)
-            implementation(libs.androidx.media3.container)
-            implementation(libs.androidx.media3.extractor)
-            implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("lib-*.aar"))))
+            implementation(libs.androidx.media3.datasource)
+            // mpv-android: native .so files live in src/androidMain/jniLibs/; Kotlin wrappers
+            // (MPVLib.kt, MPVView.kt) are compiled directly from src/androidMain/kotlin/is/xyz/mpv/.
+            implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("quickjs-kt-android-*.aar"))))
         }
         commonMain.dependencies {
             implementation(libs.coil.compose)
@@ -308,11 +299,6 @@ afterEvaluate {
 dependencies {
     coreLibraryDesugaring(libs.desugar.jdk.libs)
     debugImplementation(libs.compose.uiTooling)
-}
-
-configurations.all {
-    exclude(group = "androidx.media3", module = "media3-exoplayer")
-    exclude(group = "androidx.media3", module = "media3-ui")
 }
 
 android {
@@ -357,10 +343,13 @@ android {
         jniLibs {
             pickFirsts += listOf(
                 "lib/*/libc++_shared.so",
+                "lib/*/libmpv.so",
                 "lib/*/libavcodec.so",
+                "lib/*/libavformat.so",
                 "lib/*/libavutil.so",
                 "lib/*/libswscale.so",
-                "lib/*/libswresample.so"
+                "lib/*/libswresample.so",
+                "lib/*/libavfilter.so",
             )
         }
     }

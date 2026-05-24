@@ -3,65 +3,47 @@ package com.nuvio.app.features.player
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
-import android.net.Uri
-import android.util.Log
-import android.util.TypedValue
-import android.graphics.Typeface
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
-import kotlinx.coroutines.runBlocking
-import nuvio.composeapp.generated.resources.*
-import org.jetbrains.compose.resources.getString
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import androidx.media3.common.C
-import androidx.media3.common.MediaItem
-import androidx.media3.common.MimeTypes
-import androidx.media3.common.PlaybackException
-import androidx.media3.common.Player
-import androidx.media3.common.TrackSelectionOverride
-import androidx.media3.common.util.UnstableApi
-import androidx.media3.exoplayer.DefaultLoadControl
-import androidx.media3.exoplayer.DefaultRenderersFactory
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
-import androidx.media3.exoplayer.source.MergingMediaSource
-import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
-import androidx.media3.extractor.DefaultExtractorsFactory
-import androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory
-import androidx.media3.extractor.ts.TsExtractor
-import androidx.media3.ui.AspectRatioFrameLayout
-import androidx.media3.ui.PlayerView
-import androidx.media3.ui.SubtitleView
-import androidx.media3.ui.CaptionStyleCompat
-import com.nuvio.app.R
-import io.github.peerless2012.ass.media.widget.AssSubtitleView
+import is.xyz.mpv.MPVLib
+import is.xyz.mpv.MPVView
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import java.net.HttpURLConnection
-import java.net.URL
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 private const val TAG = "NuvioPlayer"
+private val mainHandler = Handler(Looper.getMainLooper())
+private val trackListJson = Json { ignoreUnknownKeys = true }
 
-@androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 actual fun PlatformPlayerSurface(
     sourceUrl: String,
@@ -81,419 +63,437 @@ actual fun PlatformPlayerSurface(
     val lifecycleOwner = LocalLifecycleOwner.current
     val latestOnSnapshot = rememberUpdatedState(onSnapshot)
     val latestOnError = rememberUpdatedState(onError)
+    val latestSourceUrl = rememberUpdatedState(sourceUrl)
     val coroutineScope = rememberCoroutineScope()
 
-    val playerSettings = remember {
-        PlayerSettingsRepository.ensureLoaded()
-        PlayerSettingsRepository.uiState.value
-    }
+    val sanitizedHeaders = remember(sourceHeaders) { sanitizePlaybackHeaders(sourceHeaders) }
 
-    val sanitizedSourceHeaders = remember(sourceHeaders) {
-        sanitizePlaybackHeaders(sourceHeaders)
-    }
-    val sanitizedSourceResponseHeaders = remember(sourceResponseHeaders) {
-        sanitizePlaybackResponseHeaders(sourceResponseHeaders)
-    }
-    val useLibass = playerSettings.useLibass
-    val libassRenderType = runCatching {
-        LibassRenderType.valueOf(playerSettings.libassRenderType)
-    }.getOrDefault(LibassRenderType.CUES)
-    val playerSourceKey = listOf(
-        sourceUrl,
-        sourceAudioUrl.orEmpty(),
-        sanitizedSourceHeaders,
-        sanitizedSourceResponseHeaders,
-        useYoutubeChunkedPlayback,
+    var isLoading by remember { mutableStateOf(true) }
+    var isPlaying by remember { mutableStateOf(false) }
+    var isEnded by remember { mutableStateOf(false) }
+    var durationMs by remember { mutableLongStateOf(0L) }
+    var positionMs by remember { mutableLongStateOf(0L) }
+    var bufferedMs by remember { mutableLongStateOf(0L) }
+    var playbackSpeed by remember { mutableFloatStateOf(1f) }
+    var trackList by remember { mutableStateOf("[]") }
+    var externalSubId by remember { mutableIntStateOf(-1) }
+    // Guards against emitting an error for a normal EOF
+    var fileWasLoaded by remember { mutableStateOf(false) }
+
+    fun buildSnapshot() = PlayerPlaybackSnapshot(
+        isLoading = isLoading,
+        isPlaying = isPlaying,
+        isEnded = isEnded,
+        durationMs = durationMs,
+        positionMs = positionMs,
+        bufferedPositionMs = bufferedMs,
+        playbackSpeed = playbackSpeed,
     )
-    var decoderPriorityOverride by remember(playerSourceKey) { mutableStateOf<Int?>(null) }
-    var fallbackStartPositionMs by remember(playerSourceKey) { mutableStateOf<Long?>(null) }
-    val effectiveDecoderPriority = decoderPriorityOverride ?: playerSettings.decoderPriority
 
-    val exoPlayer = remember(
-        sourceUrl,
-        sourceAudioUrl,
-        sanitizedSourceHeaders,
-        sanitizedSourceResponseHeaders,
-        useYoutubeChunkedPlayback,
-        effectiveDecoderPriority,
-    ) {
-        val renderersFactory = DefaultRenderersFactory(context)
-            .setExtensionRendererMode(effectiveDecoderPriority)
-            .setEnableDecoderFallback(true)
-            .setMapDV7ToHevc(playerSettings.mapDV7ToHevc)
+    fun pushSnapshot() = latestOnSnapshot.value(buildSnapshot())
 
-        val trackSelector = DefaultTrackSelector(context).apply {
-            setParameters(
-                buildUponParameters()
-                    .setAllowInvalidateSelectionsOnRendererCapabilitiesChange(true)
-            )
-            if (playerSettings.tunnelingEnabled) {
-                setParameters(buildUponParameters().setTunnelingEnabled(true))
-            }
+    val mpvView = remember { MPVView(context, null) }
+
+    // Create and init MPV once for the lifetime of this Composable.
+    DisposableEffect(Unit) {
+        MPVLib.create(context)
+
+        // All options must be set before MPVLib.init().
+        MPVLib.setOptionString("config", "no")
+        // Android GPU renderer via OpenGL ES.
+        MPVLib.setOptionString("gpu-context", "android")
+        MPVLib.setOptionString("opengl-es", "yes")
+        MPVLib.setOptionString("vo", "gpu")
+        // Audio output: hardware AudioTrack, fall back to OpenSL ES.
+        MPVLib.setOptionString("ao", "audiotrack,opensles")
+        // Hardware decode first, transparent SW fallback.
+        MPVLib.setOptionString("hwdec", "auto")
+        MPVLib.setOptionString("hwdec-codecs", "all")
+        // Networking
+        MPVLib.setOptionString("network-timeout", "15")
+        MPVLib.setOptionString(
+            "user-agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        // Buffering
+        MPVLib.setOptionString("demuxer-max-bytes", "104857600")   // 100 MiB
+        MPVLib.setOptionString("demuxer-readahead-secs", "20")
+        MPVLib.setOptionString("cache", "yes")
+        // Subtitles – MPV includes libass natively so all formats (ASS/SSA/SRT/VTT) work out of the box.
+        MPVLib.setOptionString("sub-ass", "yes")
+        MPVLib.setOptionString("sub-auto", "fuzzy")
+        // Shader cache to speed up subsequent launches.
+        MPVLib.setOptionString("gpu-shader-cache-dir", context.cacheDir.path)
+        // Stay alive waiting for the first loadfile command.
+        MPVLib.setOptionString("idle", "once")
+
+        MPVLib.init()
+
+        MPVLib.setOptionString("force-window", "no")
+        mpvView.initialize()
+
+        onDispose {
+            mpvView.destroy()
+            MPVLib.destroy()
         }
+    }
 
-        val loadControl = DefaultLoadControl.Builder()
-            .setTargetBufferBytes(100 * 1024 * 1024)
-            .setBufferDurationsMs(
-                DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
-                70_000,
-                DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS,
-                5_000
-            )
-            .build()
+    // Load source whenever URL or headers change.
+    LaunchedEffect(sourceUrl, sourceAudioUrl, sanitizedHeaders) {
+        isLoading = true
+        isEnded = false
+        fileWasLoaded = false
 
-        val extractorsFactory = DefaultExtractorsFactory()
-            .setTsExtractorFlags(DefaultTsPayloadReaderFactory.FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS)
-            .setTsExtractorTimestampSearchBytes(1500 * TsExtractor.TS_PACKET_SIZE)
+        val headerStr = sanitizedHeaders.entries
+            .filter { !it.key.equals("Range", ignoreCase = true) }
+            .joinToString("\n") { "${it.key}: ${it.value}" }
+        MPVLib.setOptionString("http-header-fields", headerStr)
 
-        val dataSourceFactory = PlatformPlaybackDataSourceFactory.create(
-            context = context,
-                defaultRequestHeaders = sanitizedSourceHeaders,
-                defaultResponseHeaders = sanitizedSourceResponseHeaders,
-                useYoutubeChunkedPlayback = useYoutubeChunkedPlayback,
-            )
-
-        val player = if (useLibass) {
-            ExoPlayer.Builder(context)
-                .setTrackSelector(trackSelector)
-                .setLoadControl(loadControl)
-                .buildWithAssSupportCompat(
-                    context = context,
-                    renderType = libassRenderType.toAssRenderType(),
-                    dataSourceFactory = dataSourceFactory,
-                    extractorsFactory = extractorsFactory,
-                    renderersFactory = renderersFactory
-                )
+        if (!sourceAudioUrl.isNullOrBlank()) {
+            // Load video and attach the external audio track in one shot.
+            MPVLib.command(arrayOf("loadfile", sourceUrl, "replace", "audio-file=$sourceAudioUrl"))
         } else {
-            val mediaSourceFactory = DefaultMediaSourceFactory(
-                dataSourceFactory,
-                extractorsFactory,
-            )
-
-            ExoPlayer.Builder(context)
-                .setRenderersFactory(renderersFactory)
-                .setTrackSelector(trackSelector)
-                .setLoadControl(loadControl)
-                .setMediaSourceFactory(mediaSourceFactory)
-                .build()
+            MPVLib.command(arrayOf("loadfile", sourceUrl))
         }
-
-        player.apply {
-                if (!sourceAudioUrl.isNullOrBlank()) {
-                    val msf = DefaultMediaSourceFactory(dataSourceFactory, extractorsFactory)
-                    val videoSource = msf.createMediaSource(MediaItem.fromUri(sourceUrl))
-                    val audioSource = msf.createMediaSource(MediaItem.fromUri(sourceAudioUrl))
-                    setMediaSource(MergingMediaSource(videoSource, audioSource))
-                } else {
-                    setMediaItem(MediaItem.fromUri(sourceUrl))
-                }
-                fallbackStartPositionMs?.let { seekTo(it.coerceAtLeast(0L)) }
-                prepare()
-                this.playWhenReady = playWhenReady
-            }
     }
 
-    val pendingSubtitleTrackIndex = remember { mutableListOf<Int>() }
-    var playerViewRef by remember { mutableStateOf<PlayerView?>(null) }
-    var currentSubtitleStyle by remember { mutableStateOf(SubtitleStyleState.DEFAULT) }
-    var subtitleSelectionJob by remember { mutableStateOf<Job?>(null) }
-
-    fun syncPlayerViewKeepScreenOn() {
-        playerViewRef?.keepScreenOn = exoPlayer.shouldKeepPlayerScreenOn()
-    }
-
-    DisposableEffect(exoPlayer) {
-        PlayerPictureInPictureManager.registerPausePlaybackCallback {
-            exoPlayer.pause()
-        }
-
-        val listener = object : Player.Listener {
-            override fun onPlayerError(error: PlaybackException) {
-                syncPlayerViewKeepScreenOn()
-                if (
-                    playerSettings.decoderPriority == DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON &&
-                    effectiveDecoderPriority != DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER &&
-                    error.isDecoderFailure()
-                ) {
-                    Log.w(
-                        TAG,
-                        "Decoder failure (${error.errorCodeName}); retrying with app decoders",
-                        error,
-                    )
-                    fallbackStartPositionMs = exoPlayer.currentPosition.coerceAtLeast(0L)
-                    decoderPriorityOverride = DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER
-                    latestOnError.value(null)
-                    return
+    // MPV event and property observer.
+    DisposableEffect(Unit) {
+        val observer = object : MPVLib.EventObserver {
+            override fun eventProperty(property: String) {
+                if (property == "track-list") {
+                    val json = MPVLib.getPropertyString("track-list") ?: "[]"
+                    mainHandler.post { trackList = json }
                 }
-                latestOnError.value(error.localizedMessage ?: runBlocking { getString(Res.string.player_unable_to_play_stream) })
             }
 
-            override fun onPlaybackStateChanged(playbackState: Int) {
-                val stateName = when (playbackState) {
-                    Player.STATE_IDLE -> "IDLE"
-                    Player.STATE_BUFFERING -> "BUFFERING"
-                    Player.STATE_READY -> "READY"
-                    Player.STATE_ENDED -> "ENDED"
-                    else -> "UNKNOWN($playbackState)"
+            override fun eventProperty(property: String, value: Long) {
+                mainHandler.post {
+                    when (property) {
+                        "time-pos" -> positionMs = (value * 1000L).coerceAtLeast(0L)
+                        "duration" -> durationMs = (value * 1000L).coerceAtLeast(0L)
+                        "demuxer-cache-time" -> bufferedMs = (value * 1000L).coerceAtLeast(0L)
+                    }
+                    pushSnapshot()
                 }
-                Log.d(TAG, "onPlaybackStateChanged: $stateName")
-                if (playbackState == Player.STATE_READY) {
-                    fallbackStartPositionMs = null
-                    latestOnError.value(null)
-                    exoPlayer.logCurrentTracks("STATE_READY")
+            }
+
+            override fun eventProperty(property: String, value: Boolean) {
+                mainHandler.post {
+                    when (property) {
+                        "pause" -> {
+                            isPlaying = !value
+                            mpvView.keepScreenOn = isPlaying && !isEnded
+                        }
+                        "paused-for-cache" -> isLoading = value
+                        "eof-reached" -> if (value) {
+                            isEnded = true
+                            isLoading = false
+                            mpvView.keepScreenOn = false
+                        }
+                    }
+                    pushSnapshot()
                 }
-                syncPlayerViewKeepScreenOn()
-                latestOnSnapshot.value(exoPlayer.snapshot())
             }
 
-            override fun onIsPlayingChanged(isPlaying: Boolean) {
-                syncPlayerViewKeepScreenOn()
-                latestOnSnapshot.value(exoPlayer.snapshot())
-            }
-
-            override fun onPlaybackParametersChanged(playbackParameters: androidx.media3.common.PlaybackParameters) {
-                latestOnSnapshot.value(exoPlayer.snapshot())
-            }
-
-            override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
-                Log.d(TAG, "onTracksChanged: ${tracks.groups.size} groups total")
-                exoPlayer.logCurrentTracks("onTracksChanged")
-                if (pendingSubtitleTrackIndex.isNotEmpty() && tracks.groups.isNotEmpty()) {
-                    val idx = pendingSubtitleTrackIndex.removeAt(0)
-                    Log.d(TAG, "onTracksChanged: applying pending subtitle selection index=$idx")
-                    exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
-                        .buildUpon()
-                        .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, idx < 0)
-                        .build()
-                    if (idx >= 0) {
-                        exoPlayer.selectTrackByIndex(C.TRACK_TYPE_TEXT, idx)
+            override fun eventProperty(property: String, value: String) {
+                if (property == "speed") {
+                    mainHandler.post {
+                        playbackSpeed = value.toFloatOrNull() ?: 1f
+                        pushSnapshot()
                     }
                 }
-                latestOnSnapshot.value(exoPlayer.snapshot())
             }
 
+            override fun eventProperty(property: String, value: Double) { /* unused */ }
+
+            override fun event(eventId: Int) {
+                when (eventId) {
+                    MPVLib.MpvEvent.MPV_EVENT_FILE_LOADED -> mainHandler.post {
+                        fileWasLoaded = true
+                        isLoading = false
+                        isEnded = false
+                        latestOnError.value(null)
+                        trackList = MPVLib.getPropertyString("track-list") ?: "[]"
+                        Log.d(TAG, "FILE_LOADED: tracks=$trackList")
+                        pushSnapshot()
+                    }
+                    MPVLib.MpvEvent.MPV_EVENT_END_FILE -> mainHandler.post {
+                        if (!fileWasLoaded) {
+                            Log.w(TAG, "END_FILE without prior FILE_LOADED – playback error")
+                            latestOnError.value("Playback failed")
+                        } else {
+                            isEnded = true
+                        }
+                        fileWasLoaded = false
+                        isLoading = false
+                        mpvView.keepScreenOn = false
+                        pushSnapshot()
+                    }
+                    MPVLib.MpvEvent.MPV_EVENT_PLAYBACK_RESTART -> mainHandler.post {
+                        isLoading = false
+                        pushSnapshot()
+                    }
+                }
+            }
         }
-        exoPlayer.addListener(listener)
-        onDispose {
-            PlayerPictureInPictureManager.registerPausePlaybackCallback(null)
-            exoPlayer.removeListener(listener)
-            playerViewRef?.keepScreenOn = false
-            subtitleSelectionJob?.cancel()
-        }
+
+        MPVLib.addObserver(observer)
+        MPVLib.observeProperty("time-pos", MPVLib.MpvFormat.MPV_FORMAT_INT64)
+        MPVLib.observeProperty("duration", MPVLib.MpvFormat.MPV_FORMAT_INT64)
+        MPVLib.observeProperty("demuxer-cache-time", MPVLib.MpvFormat.MPV_FORMAT_INT64)
+        MPVLib.observeProperty("pause", MPVLib.MpvFormat.MPV_FORMAT_FLAG)
+        MPVLib.observeProperty("paused-for-cache", MPVLib.MpvFormat.MPV_FORMAT_FLAG)
+        MPVLib.observeProperty("eof-reached", MPVLib.MpvFormat.MPV_FORMAT_FLAG)
+        MPVLib.observeProperty("speed", MPVLib.MpvFormat.MPV_FORMAT_STRING)
+        MPVLib.observeProperty("track-list", MPVLib.MpvFormat.MPV_FORMAT_STRING)
+
+        onDispose { MPVLib.removeObserver(observer) }
     }
 
-    DisposableEffect(exoPlayer, lifecycleOwner) {
+    // Register PiP pause callback.
+    DisposableEffect(Unit) {
+        PlayerPictureInPictureManager.registerPausePlaybackCallback {
+            MPVLib.setPropertyBoolean("pause", true)
+        }
+        onDispose { PlayerPictureInPictureManager.registerPausePlaybackCallback(null) }
+    }
+
+    // Pause on background, resume on foreground.
+    DisposableEffect(lifecycleOwner) {
         val activity = context.findActivity()
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_START -> exoPlayer.playWhenReady = playWhenReady
+                Lifecycle.Event.ON_START -> if (playWhenReady) MPVLib.setPropertyBoolean("pause", false)
                 Lifecycle.Event.ON_STOP -> {
-                    val isInPictureInPicture =
-                        Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && activity?.isInPictureInPictureMode == true
-                    val isFinishing = activity?.isFinishing == true
-                    if (!isInPictureInPicture || isFinishing) {
-                        exoPlayer.pause()
+                    val isInPiP = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
+                        activity?.isInPictureInPictureMode == true
+                    if (!isInPiP || activity?.isFinishing == true) {
+                        MPVLib.setPropertyBoolean("pause", true)
                     }
                 }
                 else -> Unit
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
-            exoPlayer.release()
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // Sync external playWhenReady changes.
+    LaunchedEffect(playWhenReady) {
+        MPVLib.setPropertyBoolean("pause", !playWhenReady)
+        pushSnapshot()
+    }
+
+    // Periodic position poll for smooth progress bar (250 ms cadence).
+    LaunchedEffect(Unit) {
+        while (isActive) {
+            delay(250L)
+            val pos = MPVLib.getPropertyDouble("time-pos")
+            val dur = MPVLib.getPropertyDouble("duration")
+            val buf = MPVLib.getPropertyDouble("demuxer-cache-time")
+            if (pos != null) positionMs = (pos * 1000.0).toLong().coerceAtLeast(0L)
+            if (dur != null) durationMs = (dur * 1000.0).toLong().coerceAtLeast(0L)
+            if (buf != null) bufferedMs = (buf * 1000.0).toLong().coerceAtLeast(0L)
+            pushSnapshot()
         }
     }
 
-    LaunchedEffect(exoPlayer, playWhenReady) {
-        exoPlayer.playWhenReady = playWhenReady
-        syncPlayerViewKeepScreenOn()
-        latestOnSnapshot.value(exoPlayer.snapshot())
-    }
+    // Expose the PlayerEngineController.
+    LaunchedEffect(Unit) {
+        onControllerReady(object : PlayerEngineController {
+            override fun play() {
+                MPVLib.setPropertyBoolean("pause", false)
+            }
 
-    LaunchedEffect(exoPlayer) {
-        onControllerReady(
-            object : PlayerEngineController {
-                override fun play() {
-                    exoPlayer.playWhenReady = true
-                    exoPlayer.play()
+            override fun pause() {
+                MPVLib.setPropertyBoolean("pause", true)
+            }
+
+            override fun seekTo(positionMs: Long) {
+                MPVLib.command(
+                    arrayOf("seek", (positionMs / 1000.0).toString(), "absolute", "exact")
+                )
+            }
+
+            override fun seekBy(offsetMs: Long) {
+                MPVLib.command(
+                    arrayOf("seek", (offsetMs / 1000.0).toString(), "relative", "exact")
+                )
+            }
+
+            override fun retry() {
+                isLoading = true
+                isEnded = false
+                fileWasLoaded = false
+                MPVLib.command(arrayOf("loadfile", latestSourceUrl.value))
+            }
+
+            override fun setPlaybackSpeed(speed: Float) {
+                MPVLib.setPropertyDouble("speed", speed.toDouble())
+            }
+
+            override fun getAudioTracks(): List<AudioTrack> =
+                parseMpvTracks(trackList, "audio").mapIndexed { idx, t ->
+                    AudioTrack(
+                        index = idx,
+                        id = t.id.toString(),
+                        label = t.label,
+                        language = t.lang,
+                        isSelected = t.selected,
+                    )
                 }
 
-                override fun pause() {
-                    exoPlayer.pause()
+            override fun getSubtitleTracks(): List<SubtitleTrack> =
+                parseMpvTracks(trackList, "sub").mapIndexed { idx, t ->
+                    SubtitleTrack(
+                        index = idx,
+                        id = t.id.toString(),
+                        label = t.label,
+                        language = t.lang,
+                        isSelected = t.selected,
+                        isForced = inferForcedSubtitleTrack(
+                            label = t.label,
+                            language = t.lang,
+                            trackId = t.id.toString(),
+                            hasForcedSelectionFlag = false,
+                        ),
+                    )
                 }
 
-                override fun seekTo(positionMs: Long) {
-                    exoPlayer.seekTo(positionMs.coerceAtLeast(0L))
+            override fun selectAudioTrack(index: Int) {
+                val track = parseMpvTracks(trackList, "audio").getOrNull(index) ?: return
+                Log.d(TAG, "selectAudioTrack: index=$index id=${track.id}")
+                MPVLib.setPropertyInt("aid", track.id)
+            }
+
+            override fun selectSubtitleTrack(index: Int) {
+                Log.d(TAG, "selectSubtitleTrack: index=$index")
+                if (index < 0) {
+                    MPVLib.setPropertyString("sid", "no")
+                    return
                 }
+                val track = parseMpvTracks(trackList, "sub").getOrNull(index) ?: return
+                MPVLib.setPropertyInt("sid", track.id)
+            }
 
-                override fun seekBy(offsetMs: Long) {
-                    exoPlayer.seekTo((exoPlayer.currentPosition + offsetMs).coerceAtLeast(0L))
+            override fun setSubtitleUri(url: String) {
+                Log.d(TAG, "setSubtitleUri: url=$url")
+                if (externalSubId >= 0) {
+                    MPVLib.command(arrayOf("sub-remove", externalSubId.toString()))
+                    externalSubId = -1
                 }
-
-                override fun retry() {
-                    exoPlayer.prepare()
-                    exoPlayer.playWhenReady = true
-                }
-
-                override fun setPlaybackSpeed(speed: Float) {
-                    exoPlayer.setPlaybackSpeed(speed)
-                }
-
-                override fun getAudioTracks(): List<AudioTrack> =
-                    exoPlayer.extractAudioTracks(context)
-
-                override fun getSubtitleTracks(): List<SubtitleTrack> {
-                    val tracks = exoPlayer.extractSubtitleTracks(context)
-                    Log.d(TAG, "getSubtitleTracks: found ${tracks.size} tracks")
-                    tracks.forEach { t ->
-                        Log.d(TAG, "  track idx=${t.index} id=${t.id} label='${t.label}' lang=${t.language} selected=${t.isSelected}")
-                    }
-                    return tracks
-                }
-
-                override fun selectAudioTrack(index: Int) {
-                    exoPlayer.selectTrackByIndex(C.TRACK_TYPE_AUDIO, index)
-                }
-
-                override fun selectSubtitleTrack(index: Int) {
-                    Log.d(TAG, "selectSubtitleTrack: index=$index")
-                    if (index < 0) {
-                        Log.d(TAG, "selectSubtitleTrack: disabling text tracks")
-                        exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
-                            .buildUpon()
-                            .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
-                            .build()
-                        return
-                    }
-                    exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
-                        .buildUpon()
-                        .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
-                        .build()
-                    exoPlayer.selectTrackByIndex(C.TRACK_TYPE_TEXT, index)
-                    Log.d(TAG, "selectSubtitleTrack: after selection, textDisabled=${exoPlayer.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT)}")
-                    exoPlayer.logCurrentTracks("after selectSubtitleTrack")
-                }
-
-                override fun setSubtitleUri(url: String) {
-                    Log.d(TAG, "setSubtitleUri: url=$url")
-                    subtitleSelectionJob?.cancel()
-                    subtitleSelectionJob = coroutineScope.launch {
-                        val currentPosition = exoPlayer.currentPosition
-                        val wasPlaying = exoPlayer.isPlaying
-                        val currentMediaItem = exoPlayer.currentMediaItem ?: run {
-                            Log.e(TAG, "setSubtitleUri: currentMediaItem is null, aborting")
-                            return@launch
-                        }
-                        val resolvedMime = withContext(Dispatchers.IO) {
-                            resolveSubtitleMimeType(url)
-                        }
-                        Log.d(TAG, "setSubtitleUri: currentPosition=$currentPosition, wasPlaying=$wasPlaying")
-                        val subtitleConfig = MediaItem.SubtitleConfiguration.Builder(Uri.parse(url))
-                            .setMimeType(resolvedMime)
-                            .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
-                            .setRoleFlags(C.ROLE_FLAG_SUBTITLE)
-                            .build()
-                        Log.d(
-                            TAG,
-                            "setSubtitleUri: subtitleConfig built, uri=${subtitleConfig.uri}, mime=${subtitleConfig.mimeType}, selectionFlags=${subtitleConfig.selectionFlags}"
-                        )
-                        val newMediaItem = currentMediaItem.buildUpon()
-                            .setSubtitleConfigurations(listOf(subtitleConfig))
-                            .build()
-                        Log.d(TAG, "setSubtitleUri: newMediaItem subtitleConfigs count=${newMediaItem.localConfiguration?.subtitleConfigurations?.size}")
-                        exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
-                            .buildUpon()
-                            .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
-                            .clearOverridesOfType(C.TRACK_TYPE_TEXT)
-                            .setPreferredTextRoleFlags(C.ROLE_FLAG_SUBTITLE)
-                            .build()
-                        Log.d(TAG, "setSubtitleUri: track params set before prepare, textDisabled=${exoPlayer.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT)}")
-                        exoPlayer.setMediaItem(newMediaItem, currentPosition)
-                        exoPlayer.prepare()
-                        exoPlayer.playWhenReady = wasPlaying
-                        Log.d(TAG, "setSubtitleUri: prepare() called, waiting for STATE_READY")
-                    }
-                }
-
-                override fun clearExternalSubtitle() {
-                    Log.d(TAG, "clearExternalSubtitle called")
-                    val currentPosition = exoPlayer.currentPosition
-                    val wasPlaying = exoPlayer.isPlaying
-                    val currentMediaItem = exoPlayer.currentMediaItem ?: return
-                    val newMediaItem = currentMediaItem.buildUpon()
-                        .setSubtitleConfigurations(emptyList())
-                        .build()
-                    exoPlayer.setMediaItem(newMediaItem, currentPosition)
-                    exoPlayer.prepare()
-                    exoPlayer.playWhenReady = wasPlaying
-                    Log.d(TAG, "clearExternalSubtitle: done, position=$currentPosition")
-                }
-
-                override fun clearExternalSubtitleAndSelect(trackIndex: Int) {
-                    Log.d(TAG, "clearExternalSubtitleAndSelect: trackIndex=$trackIndex")
-                    pendingSubtitleTrackIndex.clear()
-                    pendingSubtitleTrackIndex.add(trackIndex)
-                    val currentPosition = exoPlayer.currentPosition
-                    val wasPlaying = exoPlayer.isPlaying
-                    val currentMediaItem = exoPlayer.currentMediaItem ?: return
-                    val newMediaItem = currentMediaItem.buildUpon()
-                        .setSubtitleConfigurations(emptyList())
-                        .build()
-                    exoPlayer.setMediaItem(newMediaItem, currentPosition)
-                    exoPlayer.prepare()
-                    exoPlayer.playWhenReady = wasPlaying
-                    Log.d(TAG, "clearExternalSubtitleAndSelect: done, pending=$trackIndex position=$currentPosition")
-                }
-
-                override fun applySubtitleStyle(style: SubtitleStyleState) {
-                    currentSubtitleStyle = style
-                    playerViewRef?.applySubtitleStyle(style)
+                MPVLib.command(arrayOf("sub-add", url, "select"))
+                // Capture the newly added external track id after MPV processes the command.
+                coroutineScope.launch {
+                    delay(300L)
+                    val json = MPVLib.getPropertyString("track-list") ?: "[]"
+                    trackList = json
+                    externalSubId = parseMpvTracks(json, "sub")
+                        .lastOrNull { it.external }?.id ?: -1
+                    Log.d(TAG, "setSubtitleUri: externalSubId=$externalSubId")
                 }
             }
-        )
+
+            override fun clearExternalSubtitle() {
+                Log.d(TAG, "clearExternalSubtitle: externalSubId=$externalSubId")
+                if (externalSubId >= 0) {
+                    MPVLib.command(arrayOf("sub-remove", externalSubId.toString()))
+                    externalSubId = -1
+                }
+                MPVLib.setPropertyString("sid", "no")
+                trackList = MPVLib.getPropertyString("track-list") ?: trackList
+            }
+
+            override fun clearExternalSubtitleAndSelect(trackIndex: Int) {
+                Log.d(TAG, "clearExternalSubtitleAndSelect: trackIndex=$trackIndex externalSubId=$externalSubId")
+                if (externalSubId >= 0) {
+                    MPVLib.command(arrayOf("sub-remove", externalSubId.toString()))
+                    externalSubId = -1
+                }
+                val updatedJson = MPVLib.getPropertyString("track-list") ?: trackList
+                trackList = updatedJson
+                if (trackIndex >= 0) {
+                    val track = parseMpvTracks(updatedJson, "sub").getOrNull(trackIndex)
+                    if (track != null) MPVLib.setPropertyInt("sid", track.id)
+                } else {
+                    MPVLib.setPropertyString("sid", "no")
+                }
+            }
+
+            override fun applySubtitleStyle(style: SubtitleStyleState) {
+                MPVLib.setPropertyInt("sub-font-size", style.fontSizeSp)
+                MPVLib.setPropertyString("sub-color", style.textColor.toMpvColor())
+                MPVLib.setPropertyInt("sub-border-size", if (style.outlineEnabled) 2 else 0)
+                MPVLib.setPropertyInt("sub-margin-y", style.bottomOffset)
+            }
+        })
     }
 
-    LaunchedEffect(exoPlayer) {
-        while (isActive) {
-            latestOnSnapshot.value(exoPlayer.snapshot())
-            delay(250L)
+    // Apply resize mode whenever it changes.
+    LaunchedEffect(resizeMode) {
+        when (resizeMode) {
+            PlayerResizeMode.Fit -> {
+                MPVLib.setPropertyString("keepaspect", "yes")
+                MPVLib.setPropertyDouble("panscan", 0.0)
+            }
+            PlayerResizeMode.Fill -> MPVLib.setPropertyString("keepaspect", "no")
+            PlayerResizeMode.Zoom -> {
+                MPVLib.setPropertyString("keepaspect", "yes")
+                MPVLib.setPropertyDouble("panscan", 1.0)
+            }
         }
     }
 
     AndroidView(
         modifier = modifier,
-        factory = { viewContext ->
-            PlayerView(viewContext).apply {
-                useController = useNativeController
+        factory = {
+            mpvView.apply {
                 layoutParams = android.view.ViewGroup.LayoutParams(MATCH_PARENT, MATCH_PARENT)
-                player = exoPlayer
-                keepScreenOn = exoPlayer.shouldKeepPlayerScreenOn()
-                this.resizeMode = resizeMode.toExoResizeMode()
-                setShutterBackgroundColor(android.graphics.Color.BLACK)
-                playerViewRef = this
-                syncLibassOverlay(
-                    player = exoPlayer,
-                    enabled = useLibass,
-                    renderType = libassRenderType,
-                )
-                applySubtitleStyle(currentSubtitleStyle)
             }
         },
-        update = { playerView ->
-            playerView.player = exoPlayer
-            playerView.useController = useNativeController
-            playerView.resizeMode = resizeMode.toExoResizeMode()
-            playerViewRef = playerView
-            syncPlayerViewKeepScreenOn()
-            playerView.syncLibassOverlay(
-                player = exoPlayer,
-                enabled = useLibass,
-                renderType = libassRenderType,
-            )
-            playerView.applySubtitleStyle(currentSubtitleStyle)
-        },
+        update = { /* MPV drives its own surface; resize mode is handled via LaunchedEffect */ },
     )
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+private data class MpvTrackInfo(
+    val id: Int,
+    val label: String,
+    val lang: String?,
+    val selected: Boolean,
+    val external: Boolean,
+)
+
+private fun parseMpvTracks(json: String, type: String): List<MpvTrackInfo> = try {
+    trackListJson.parseToJsonElement(json).jsonArray
+        .filter { it.jsonObject["type"]?.jsonPrimitive?.contentOrNull == type }
+        .mapIndexed { listIdx, elem ->
+            val obj = elem.jsonObject
+            val id = obj["id"]?.jsonPrimitive?.intOrNull ?: return@mapIndexed null
+            val title = obj["title"]?.jsonPrimitive?.contentOrNull
+            val lang = obj["lang"]?.jsonPrimitive?.contentOrNull
+            val selected = obj["selected"]?.jsonPrimitive?.booleanOrNull ?: false
+            val external = obj["external"]?.jsonPrimitive?.booleanOrNull ?: false
+            val label = title?.takeIf { it.isNotBlank() }
+                ?: lang?.let { languageLabelForCode(it) }
+                ?: "Track ${listIdx + 1}"
+            MpvTrackInfo(id, label, lang, selected, external)
+        }
+        .filterNotNull()
+} catch (e: Exception) {
+    Log.w(TAG, "parseMpvTracks failed for type=$type", e)
+    emptyList()
+}
+
+// MPV color format: R/G/B/A as 0.0–1.0 components.
+private fun Color.toMpvColor(): String {
+    fun fmt(v: Float) = "%.3f".format(v)
+    return "${fmt(red)}/${fmt(green)}/${fmt(blue)}/${fmt(alpha)}"
 }
 
 private tailrec fun Context.findActivity(): Activity? =
@@ -502,282 +502,3 @@ private tailrec fun Context.findActivity(): Activity? =
         is ContextWrapper -> baseContext.findActivity()
         else -> null
     }
-
-private fun ExoPlayer.snapshot(): PlayerPlaybackSnapshot =
-    PlayerPlaybackSnapshot(
-        isLoading = playbackState == Player.STATE_IDLE || playbackState == Player.STATE_BUFFERING,
-        isPlaying = isPlaying,
-        isEnded = playbackState == Player.STATE_ENDED,
-        durationMs = duration.coerceAtLeast(0L),
-        positionMs = currentPosition.coerceAtLeast(0L),
-        bufferedPositionMs = bufferedPosition.coerceAtLeast(0L),
-        playbackSpeed = playbackParameters.speed,
-    )
-
-private fun ExoPlayer.shouldKeepPlayerScreenOn(): Boolean =
-    playerError == null &&
-        playWhenReady &&
-        playbackState in setOf(Player.STATE_BUFFERING, Player.STATE_READY)
-
-private fun PlaybackException.isDecoderFailure(): Boolean =
-    errorCode in setOf(
-        PlaybackException.ERROR_CODE_DECODER_INIT_FAILED,
-        PlaybackException.ERROR_CODE_DECODER_QUERY_FAILED,
-        PlaybackException.ERROR_CODE_DECODING_FAILED,
-        PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES,
-        PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED,
-        PlaybackException.ERROR_CODE_DECODING_RESOURCES_RECLAIMED,
-    )
-
-private fun PlayerResizeMode.toExoResizeMode(): Int =
-    when (this) {
-        PlayerResizeMode.Fit -> AspectRatioFrameLayout.RESIZE_MODE_FIT
-        PlayerResizeMode.Fill -> AspectRatioFrameLayout.RESIZE_MODE_FILL
-        PlayerResizeMode.Zoom -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-    }
-
-private fun PlayerView.syncLibassOverlay(
-    player: ExoPlayer,
-    enabled: Boolean,
-    renderType: LibassRenderType,
-) {
-    val containerId = if (renderType == LibassRenderType.OVERLAY_OPEN_GL) {
-        R.id.libass_overlay_container_gl
-    } else {
-        R.id.libass_overlay_container
-    }
-    val overlayContainer = findViewById<android.widget.FrameLayout>(containerId) ?: return
-    val needsOverlay = enabled && renderType.usesOverlaySubtitleView()
-    val boundPlayer = getTag(R.id.libass_overlay_bound_player) as? ExoPlayer
-    val hasOverlayChild = overlayContainer.hasAssOverlayChild()
-
-    if (!needsOverlay) {
-        if (hasOverlayChild) {
-            overlayContainer.removeAssOverlayChildren()
-        }
-        if (boundPlayer != null) {
-            setTag(R.id.libass_overlay_bound_player, null)
-        }
-        return
-    }
-
-    val assHandler = player.getAssHandlerCompat() ?: return
-    if (boundPlayer === player && hasOverlayChild) {
-        return
-    }
-
-    overlayContainer.removeAssOverlayChildren()
-    val assSubtitleView = AssSubtitleView(overlayContainer.context, assHandler)
-    overlayContainer.addView(
-        assSubtitleView,
-        android.widget.FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
-    )
-    setTag(R.id.libass_overlay_bound_player, player)
-}
-
-private fun LibassRenderType.usesOverlaySubtitleView(): Boolean =
-    this == LibassRenderType.OVERLAY_CANVAS || this == LibassRenderType.OVERLAY_OPEN_GL
-
-private fun android.widget.FrameLayout.hasAssOverlayChild(): Boolean {
-    for (index in 0 until childCount) {
-        if (getChildAt(index) is AssSubtitleView) {
-            return true
-        }
-    }
-    return false
-}
-
-private fun android.widget.FrameLayout.removeAssOverlayChildren() {
-    for (index in childCount - 1 downTo 0) {
-        if (getChildAt(index) is AssSubtitleView) {
-            removeViewAt(index)
-        }
-    }
-}
-
-private fun PlayerView.applySubtitleStyle(style: SubtitleStyleState) {
-    subtitleView?.apply {
-        val baseBottomPaddingFraction = SubtitleView.DEFAULT_BOTTOM_PADDING_FRACTION * 2f / 3f
-        val offsetFraction = (style.bottomOffset / 1000f).coerceIn(0f, 0.2f)
-        val bottomPaddingFraction = (baseBottomPaddingFraction + offsetFraction).coerceIn(0f, 0.4f)
-
-        setApplyEmbeddedStyles(false)
-        setApplyEmbeddedFontSizes(false)
-        setBottomPaddingFraction(bottomPaddingFraction)
-        setStyle(
-            CaptionStyleCompat(
-                style.textColor.toArgb(),
-                android.graphics.Color.TRANSPARENT,
-                android.graphics.Color.TRANSPARENT,
-                if (style.outlineEnabled) CaptionStyleCompat.EDGE_TYPE_OUTLINE else CaptionStyleCompat.EDGE_TYPE_NONE,
-                android.graphics.Color.BLACK,
-                Typeface.DEFAULT,
-            )
-        )
-        setFixedTextSize(TypedValue.COMPLEX_UNIT_SP, style.fontSizeSp.toFloat())
-    }
-}
-
-private fun ExoPlayer.extractAudioTracks(context: Context): List<AudioTrack> {
-    val tracks = mutableListOf<AudioTrack>()
-    val trackNameProvider = CustomDefaultTrackNameProvider(context.resources)
-    var idx = 0
-    for (group in currentTracks.groups) {
-        if (group.type != C.TRACK_TYPE_AUDIO) continue
-        val format = group.mediaTrackGroup.getFormat(0)
-        val label = trackNameProvider.getTrackName(format).takeIf { it.isNotBlank() }
-            ?: runBlocking { getString(Res.string.compose_player_track_number, idx + 1) }
-        tracks.add(
-            AudioTrack(
-                index = idx,
-                id = format.id ?: idx.toString(),
-                label = label,
-                language = format.language,
-                isSelected = group.isSelected,
-            )
-        )
-        idx++
-    }
-    return tracks
-}
-
-private fun ExoPlayer.extractSubtitleTracks(context: Context): List<SubtitleTrack> {
-    val tracks = mutableListOf<SubtitleTrack>()
-    val trackNameProvider = CustomDefaultTrackNameProvider(context.resources)
-    var idx = 0
-    for (group in currentTracks.groups) {
-        if (group.type != C.TRACK_TYPE_TEXT) continue
-        val format = group.mediaTrackGroup.getFormat(0)
-        val hasForcedSelectionFlag = (format.selectionFlags and C.SELECTION_FLAG_FORCED) != 0
-        tracks.add(
-            SubtitleTrack(
-                index = idx,
-                id = format.id ?: idx.toString(),
-                label = trackNameProvider.getTrackName(format),
-                language = format.language,
-                isSelected = group.isSelected,
-                isForced = inferForcedSubtitleTrack(
-                    label = format.label,
-                    language = format.language,
-                    trackId = format.id,
-                    hasForcedSelectionFlag = hasForcedSelectionFlag,
-                ),
-            )
-        )
-        idx++
-    }
-    return tracks
-}
-
-private fun ExoPlayer.selectTrackByIndex(trackType: Int, targetIndex: Int) {
-    val typeName = if (trackType == C.TRACK_TYPE_AUDIO) "AUDIO" else "TEXT"
-    Log.d(TAG, "selectTrackByIndex: type=$typeName targetIndex=$targetIndex")
-    var idx = 0
-    for (group in currentTracks.groups) {
-        if (group.type != trackType) continue
-        if (idx == targetIndex) {
-            val format = group.mediaTrackGroup.getFormat(0)
-            Log.d(TAG, "selectTrackByIndex: found group at idx=$idx, format.id=${format.id}, lang=${format.language}, label=${format.label}")
-            trackSelectionParameters = trackSelectionParameters
-                .buildUpon()
-                .setOverrideForType(
-                    TrackSelectionOverride(group.mediaTrackGroup, listOf(0))
-                )
-                .build()
-            Log.d(TAG, "selectTrackByIndex: override applied")
-            return
-        }
-        idx++
-    }
-    Log.w(TAG, "selectTrackByIndex: no group found for type=$typeName at index=$targetIndex (total groups scanned=$idx)")
-}
-
-private fun ExoPlayer.logCurrentTracks(context: String) {
-    Log.d(TAG, "--- logCurrentTracks ($context) ---")
-    Log.d(TAG, "  textDisabled=${trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT)}")
-    for (group in currentTracks.groups) {
-        val typeName = when (group.type) {
-            C.TRACK_TYPE_AUDIO -> "AUDIO"
-            C.TRACK_TYPE_TEXT -> "TEXT"
-            C.TRACK_TYPE_VIDEO -> "VIDEO"
-            else -> "OTHER(${group.type})"
-        }
-        if (group.type != C.TRACK_TYPE_TEXT && group.type != C.TRACK_TYPE_AUDIO) continue
-        val format = group.mediaTrackGroup.getFormat(0)
-        Log.d(TAG, "  group type=$typeName id=${format.id} lang=${format.language} label=${format.label} selected=${group.isSelected} supported=${group.isSupported}")
-    }
-    Log.d(TAG, "--- end logCurrentTracks ---")
-}
-
-private fun resolveSubtitleMimeType(url: String): String {
-    probeSubtitleHeaders(url)?.let { (contentType, contentDisposition) ->
-        mapSubtitleMime(contentType)?.let { return it }
-        filenameFromContentDisposition(contentDisposition)?.let(::guessSubtitleMime)?.let { return it }
-    }
-    return guessSubtitleMime(url)
-}
-
-private fun probeSubtitleHeaders(url: String): Pair<String?, String?>? {
-    val methods = listOf("HEAD", "GET")
-    methods.forEach { method ->
-        runCatching {
-            val connection = (URL(url).openConnection() as HttpURLConnection).apply {
-                requestMethod = method
-                connectTimeout = 5_000
-                readTimeout = 5_000
-                instanceFollowRedirects = true
-                setRequestProperty("Accept", "*/*")
-            }
-            try {
-                connection.responseCode
-                connection.contentType to connection.getHeaderField("Content-Disposition")
-            } finally {
-                connection.disconnect()
-            }
-        }.getOrNull()?.let { return it }
-    }
-    return null
-}
-
-private fun mapSubtitleMime(contentType: String?): String? {
-    val normalized = contentType
-        ?.substringBefore(';')
-        ?.trim()
-        ?.lowercase()
-        ?: return null
-
-    return when (normalized) {
-        "application/x-subrip",
-        "application/srt",
-        "text/srt",
-        "text/plain" -> MimeTypes.APPLICATION_SUBRIP
-        "text/vtt",
-        "application/vtt" -> MimeTypes.TEXT_VTT
-        "text/x-ssa",
-        "text/ssa",
-        "text/ass",
-        "application/x-ssa" -> MimeTypes.TEXT_SSA
-        "application/ttml+xml",
-        "text/xml",
-        "application/xml" -> MimeTypes.APPLICATION_TTML
-        else -> null
-    }
-}
-
-private fun filenameFromContentDisposition(contentDisposition: String?): String? =
-    contentDisposition
-        ?.substringAfter("filename=", missingDelimiterValue = "")
-        ?.trim()
-        ?.trim('"')
-        ?.takeIf { it.isNotEmpty() }
-
-private fun guessSubtitleMime(url: String): String {
-    val lower = url.lowercase()
-    return when {
-        lower.contains(".srt") -> MimeTypes.APPLICATION_SUBRIP
-        lower.contains(".vtt") || lower.contains(".webvtt") -> MimeTypes.TEXT_VTT
-        lower.contains(".ass") || lower.contains(".ssa") -> MimeTypes.TEXT_SSA
-        lower.contains(".ttml") || lower.contains(".dfxp") || lower.contains(".xml") -> MimeTypes.APPLICATION_TTML
-        else -> MimeTypes.TEXT_VTT
-    }
-}
