@@ -480,7 +480,7 @@ private fun parseMpvTracks(json: String, type: String): List<MpvTrackInfo> = try
             val selected = obj["selected"]?.jsonPrimitive?.booleanOrNull ?: false
             val external = obj["external"]?.jsonPrimitive?.booleanOrNull ?: false
             val label = title?.takeIf { it.isNotBlank() }
-                ?: lang?.let { languageLabelForCode(it) }
+                ?: lang?.takeIf { it.isNotBlank() }
                 ?: "Track ${listIdx + 1}"
             MpvTrackInfo(id, label, lang, selected, external)
         }
