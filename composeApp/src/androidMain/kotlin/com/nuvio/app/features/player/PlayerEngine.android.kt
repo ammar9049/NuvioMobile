@@ -96,7 +96,7 @@ actual fun PlatformPlayerSurface(
 
     // Create and init MPV once for the lifetime of this Composable.
     DisposableEffect(Unit) {
-        MPVLib.create(context)
+        MPVLib.create(context.applicationContext)
 
         // All options must be set before MPVLib.init().
         MPVLib.setOptionString("config", "no")
@@ -130,8 +130,9 @@ actual fun PlatformPlayerSurface(
 
         MPVLib.init()
 
-        MPVLib.setOptionString("force-window", "no")
-        mpvView.initialize()
+        // Notify the view that MPV is ready. If the surface was already created
+        // during the composition frame before this effect ran, it attaches immediately.
+        mpvView.onMpvInit()
 
         onDispose {
             mpvView.destroy()
