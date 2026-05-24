@@ -95,7 +95,7 @@ private fun StyleControlsCard(
                     onStyleChanged(style.copy(fontSizeSp = (style.fontSizeSp - 2).coerceAtLeast(12)))
                 },
                 onPlus = {
-                    onStyleChanged(style.copy(fontSizeSp = (style.fontSizeSp + 2).coerceAtMost(40)))
+                    onStyleChanged(style.copy(fontSizeSp = (style.fontSizeSp + 2).coerceAtMost(72)))
                 },
                 buttonSize = btnSize,
                 buttonRadius = btnRadius,
