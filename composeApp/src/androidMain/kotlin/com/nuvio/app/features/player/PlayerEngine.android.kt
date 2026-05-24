@@ -27,8 +27,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import is.xyz.mpv.MPVLib
-import is.xyz.mpv.MPVView
+import `is`.xyz.mpv.MPVLib
+import `is`.xyz.mpv.MPVView
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
