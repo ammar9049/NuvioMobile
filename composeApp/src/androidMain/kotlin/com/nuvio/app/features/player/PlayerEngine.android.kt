@@ -109,8 +109,11 @@ actual fun PlatformPlayerSurface(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
-        MPVLib.setOptionString("demuxer-max-bytes", "104857600")
-        MPVLib.setOptionString("demuxer-readahead-secs", "20")
+        // Forward buffer: 64 MiB covers ~30 s at 15 Mbps; at 2× speed that's ~15 s lookahead.
+        MPVLib.setOptionString("demuxer-max-bytes", "67108864")
+        // Back-buffer: keeps 32 MiB behind the playhead so backward seeks are instant.
+        MPVLib.setOptionString("demuxer-max-back-bytes", "33554432")
+        MPVLib.setOptionString("demuxer-readahead-secs", "30")
         MPVLib.setOptionString("cache", "yes")
         MPVLib.setOptionString("sub-ass", "yes")
         MPVLib.setOptionString("sub-auto", "fuzzy")
