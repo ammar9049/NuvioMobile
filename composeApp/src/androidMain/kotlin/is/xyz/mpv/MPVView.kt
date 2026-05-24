@@ -5,20 +5,15 @@ import android.util.AttributeSet
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 
-// Minimal surface wrapper — MPVLib lifecycle (create/init/destroy) is managed externally.
 class MPVView(context: Context, attrs: AttributeSet?) : SurfaceView(context, attrs), SurfaceHolder.Callback {
 
-    // Set to true after MPVLib.init() has been called. Guards against surfaceCreated
-    // firing before MPV is ready (which happens when the SurfaceView enters the window
-    // during the same frame that DisposableEffect runs).
+    // Guards against surfaceCreated firing before MPVLib.init() runs.
     @Volatile private var mpvReady = false
 
     init {
         holder.addCallback(this)
     }
 
-    // Call this immediately after MPVLib.init(). If the surface was already created
-    // while MPV was still initializing, attach it now.
     fun onMpvInit() {
         mpvReady = true
         val surface = holder.surface

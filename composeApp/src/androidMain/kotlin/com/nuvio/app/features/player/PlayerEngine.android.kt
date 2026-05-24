@@ -94,53 +94,36 @@ actual fun PlatformPlayerSurface(
 
     val mpvView = remember { MPVView(context, null) }
 
-    // Create and init MPV once for the lifetime of this Composable.
     DisposableEffect(Unit) {
         MPVLib.create(context.applicationContext)
-
-        // All options must be set before MPVLib.init().
         MPVLib.setOptionString("config", "no")
-        // Android GPU renderer via OpenGL ES.
         MPVLib.setOptionString("gpu-context", "android")
         MPVLib.setOptionString("opengl-es", "yes")
         MPVLib.setOptionString("vo", "gpu")
-        // Audio output: hardware AudioTrack, fall back to OpenSL ES.
         MPVLib.setOptionString("ao", "audiotrack,opensles")
-        // Hardware decode first, transparent SW fallback.
         MPVLib.setOptionString("hwdec", "auto")
         MPVLib.setOptionString("hwdec-codecs", "all")
-        // Networking
         MPVLib.setOptionString("network-timeout", "15")
         MPVLib.setOptionString(
             "user-agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
-        // Buffering
-        MPVLib.setOptionString("demuxer-max-bytes", "104857600")   // 100 MiB
+        MPVLib.setOptionString("demuxer-max-bytes", "104857600")
         MPVLib.setOptionString("demuxer-readahead-secs", "20")
         MPVLib.setOptionString("cache", "yes")
-        // Subtitles – MPV includes libass natively so all formats (ASS/SSA/SRT/VTT) work out of the box.
         MPVLib.setOptionString("sub-ass", "yes")
         MPVLib.setOptionString("sub-auto", "fuzzy")
-        // Shader cache to speed up subsequent launches.
         MPVLib.setOptionString("gpu-shader-cache-dir", context.cacheDir.path)
-        // Stay alive waiting for the first loadfile command.
         MPVLib.setOptionString("idle", "once")
-
         MPVLib.init()
-
-        // Notify the view that MPV is ready. If the surface was already created
-        // during the composition frame before this effect ran, it attaches immediately.
         mpvView.onMpvInit()
-
         onDispose {
             mpvView.destroy()
             MPVLib.destroy()
         }
     }
 
-    // Load source whenever URL or headers change.
     LaunchedEffect(sourceUrl, sourceAudioUrl, sanitizedHeaders) {
         isLoading = true
         isEnded = false
@@ -159,7 +142,6 @@ actual fun PlatformPlayerSurface(
         }
     }
 
-    // MPV event and property observer.
     DisposableEffect(Unit) {
         val observer = object : MPVLib.EventObserver {
             override fun eventProperty(property: String) {
@@ -253,7 +235,6 @@ actual fun PlatformPlayerSurface(
         onDispose { MPVLib.removeObserver(observer) }
     }
 
-    // Register PiP pause callback.
     DisposableEffect(Unit) {
         PlayerPictureInPictureManager.registerPausePlaybackCallback {
             MPVLib.setPropertyBoolean("pause", true)
@@ -261,7 +242,6 @@ actual fun PlatformPlayerSurface(
         onDispose { PlayerPictureInPictureManager.registerPausePlaybackCallback(null) }
     }
 
-    // Pause on background, resume on foreground.
     DisposableEffect(lifecycleOwner) {
         val activity = context.findActivity()
         val observer = LifecycleEventObserver { _, event ->
@@ -281,27 +261,31 @@ actual fun PlatformPlayerSurface(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // Sync external playWhenReady changes.
     LaunchedEffect(playWhenReady) {
         MPVLib.setPropertyBoolean("pause", !playWhenReady)
         pushSnapshot()
     }
 
-    // Periodic position poll for smooth progress bar (250 ms cadence).
     LaunchedEffect(Unit) {
         while (isActive) {
             delay(250L)
-            val pos = MPVLib.getPropertyDouble("time-pos")
-            val dur = MPVLib.getPropertyDouble("duration")
-            val buf = MPVLib.getPropertyDouble("demuxer-cache-time")
-            if (pos != null) positionMs = (pos * 1000.0).toLong().coerceAtLeast(0L)
-            if (dur != null) durationMs = (dur * 1000.0).toLong().coerceAtLeast(0L)
-            if (buf != null) bufferedMs = (buf * 1000.0).toLong().coerceAtLeast(0L)
-            pushSnapshot()
+            var changed = false
+            MPVLib.getPropertyDouble("time-pos")?.let {
+                val v = (it * 1000.0).toLong().coerceAtLeast(0L)
+                if (positionMs != v) { positionMs = v; changed = true }
+            }
+            MPVLib.getPropertyDouble("duration")?.let {
+                val v = (it * 1000.0).toLong().coerceAtLeast(0L)
+                if (durationMs != v) { durationMs = v; changed = true }
+            }
+            MPVLib.getPropertyDouble("demuxer-cache-time")?.let {
+                val v = (it * 1000.0).toLong().coerceAtLeast(0L)
+                if (bufferedMs != v) { bufferedMs = v; changed = true }
+            }
+            if (changed) pushSnapshot()
         }
     }
 
-    // Expose the PlayerEngineController.
     LaunchedEffect(Unit) {
         onControllerReady(object : PlayerEngineController {
             override fun play() {
@@ -432,7 +416,6 @@ actual fun PlatformPlayerSurface(
         })
     }
 
-    // Apply resize mode whenever it changes.
     LaunchedEffect(resizeMode) {
         when (resizeMode) {
             PlayerResizeMode.Fit -> {
@@ -457,10 +440,6 @@ actual fun PlatformPlayerSurface(
         update = { /* MPV drives its own surface; resize mode is handled via LaunchedEffect */ },
     )
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 private data class MpvTrackInfo(
     val id: Int,
@@ -491,7 +470,6 @@ private fun parseMpvTracks(json: String, type: String): List<MpvTrackInfo> = try
     emptyList()
 }
 
-// MPV color format: R/G/B/A as 0.0–1.0 components.
 private fun Color.toMpvColor(): String {
     fun fmt(v: Float) = "%.3f".format(v)
     return "${fmt(red)}/${fmt(green)}/${fmt(blue)}/${fmt(alpha)}"
